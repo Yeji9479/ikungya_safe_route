@@ -15,6 +15,7 @@ import numpy as np, pandas as pd, networkx as nx
 from scipy.spatial import cKDTree
 
 MAX_SNAP_M = 300          # 클릭 지점과 노드가 이보다 멀면 '범위 밖'
+ETA_SPEED_FACTOR = 0.5    # 예상 시간: 제한속도의 이 비율로 달린다고 가정 (신호·정체 대략 반영, 실시간 아님)
 
 # ---------- 좌표 변환: EPSG:5186 (GRS80 횡메르카토르) ↔ WGS84 ----------
 _A = 6378137.0; _F = 1 / 298.257222101; _E2 = _F * (2 - _F); _EP2 = _E2 / (1 - _E2)
@@ -93,6 +94,7 @@ class Engine:
         self.node_xy = node_xy
         self.tree = cKDTree(np.array([node_xy[n] for n in self.cand]))
         self.facilities = facilities
+        self.places = None
         # ---- 회전제한용 LINK 단위 탐색 준비 ----
         n = len(links)
         self.F = links['F_NODE'].to_numpy(); self.T = links['T_NODE'].to_numpy()
@@ -164,13 +166,37 @@ class Engine:
         return Route(idx, float(sub['LENGTH'].sum()), float(sub['risk_h'].sum()),
                      int((sub['risk_grade'] == 5).sum()), [pt for ll in sub['latlon'] for pt in ll])
 
-    # ---------- 이름으로 찾기 (외부 API 없이: 생활시설 + 도로명) ----------
+    # ---------- 이름·주소로 찾기 (외부 API 없이) ----------
+    # 검색 대상: 생활시설 + 동대문구 상가·건물·도로명주소(places_ddm.csv) + 도로명
+    KIND_ORDER = {'시설': 0, '건물': 1, '주소': 2, '도로': 3, '상점': 4}
+
+    @staticmethod
+    def _norm(s):
+        s = str(s)
+        for w in ('서울특별시', '서울시', '서울', '동대문구'):
+            s = s.replace(w, '')
+        return s.replace(' ', '').replace('-', '').strip()
+
     def _build_search(self):
         items = []
         if self.facilities is not None:
             for r in self.facilities.itertuples():
-                items.append({'label': f'[{r.종류}] {r.이름}', 'node': int(r.NODE_ID),
-                              'keys': f'{r.이름} {r.종류} {getattr(r, "주소", "")}'})
+                items.append(('시설', f'[{r.종류}] {r.이름}', int(r.NODE_ID),
+                              f'{r.이름} {r.종류} {getattr(r, "주소", "")}', r.이름))
+        if self.places is not None and len(self.places):
+            P = self.places
+            x, y = to5186(P['위도'].to_numpy(float), P['경도'].to_numpy(float))
+            dist, k = self.tree.query(np.column_stack([x, y]))
+            for r, dd, kk in zip(P.itertuples(), dist, k):
+                if dd > MAX_SNAP_M:
+                    continue
+                if r.종류 == '주소':
+                    lab = f'[주소] {r.주소}' + (f' ({r.건물명})' if isinstance(r.건물명, str) and r.건물명 else '')
+                else:
+                    lab = f'[{r.종류}] {r.이름} · {r.주소}'
+                items.append((r.종류, lab, int(self.cand[kk]),
+                              f'{r.이름} {r.주소} {r.건물명 if isinstance(r.건물명, str) else ""} {r.세부 if isinstance(r.세부, str) else ""}',
+                              r.이름))
         tr = self.L[(self.L['train'] == 1) & (self.L['ROAD_NAME'] != '이름 없는 도로')]
         cand = set(self.cand.tolist())
         for name, g in tr.groupby('ROAD_NAME'):
@@ -179,31 +205,78 @@ class Engine:
                 continue
             xy = np.array([self.node_xy[n] for n in nodes])
             mid = nodes[int(np.argmin(((xy - xy.mean(0)) ** 2).sum(1)))]   # 도로 가운데쯤 노드
-            items.append({'label': f'[도로] {name}', 'node': int(mid), 'keys': name})
-        self._search_items = items
+            items.append(('도로', f'[도로] {name}', int(mid), name, name))
+        self._search_items = [(kind, lab, node, self._norm(keys), self._norm(nm))
+                              for kind, lab, node, keys, nm in items]
 
     def search(self, query, limit=30):
-        """'경동시장', '경동 시장', '병원', '왕산로' 등. 띄어쓰기 무시, 정확히 맞는 것부터"""
+        """'경동시장', '경동 시장', '왕산로 214', '청량리역', '병원' 등. 띄어쓰기 무시, 정확히 맞는 것부터"""
         if not hasattr(self, '_search_items'):
             self._build_search()
-        q = str(query).replace(' ', '').strip()
+        q = self._norm(query)
         if not q:
             return []
         scored = []
-        for it in self.items_iter():
-            name = it['label'].split('] ', 1)[-1].replace(' ', '')
-            keys = it['keys'].replace(' ', '')
-            if name == q: s = 0
-            elif name.startswith(q): s = 1
-            elif q in name: s = 2
+        for kind, lab, node, keys, nm in self._search_items:
+            if nm == q: s = 0
+            elif nm.startswith(q): s = 1
+            elif q in nm: s = 2
             elif q in keys: s = 3
             else: continue
-            scored.append((s, len(name), it))
-        scored.sort(key=lambda x: (x[0], x[1]))
-        return [it for _, _, it in scored[:limit]]
+            scored.append((s, self.KIND_ORDER.get(kind, 9), len(nm), lab, node))
+        scored.sort()
+        out, seen = [], set()
+        for s, _, _, lab, node in scored:
+            if lab in seen: continue
+            seen.add(lab); out.append({'label': lab, 'node': node})
+            if len(out) >= limit: break
+        return out
 
-    def items_iter(self):
-        return self._search_items
+    # ---------- 차례대로 안내 ----------
+    @staticmethod
+    def _turn_word(d):
+        """d: 진행 방위 변화(도, +는 오른쪽)"""
+        a = abs(d)
+        if a < 25:  return '직진'
+        side = '오른쪽' if d > 0 else '왼쪽'
+        if a < 50:  return f'{side}으로 살짝'
+        if a < 150: return '우회전' if d > 0 else '좌회전'
+        return 'U턴'
+
+    def directions(self, route, min_step_m=40):
+        """경로를 '도로 이름이 바뀌는 곳'마다 끊어 안내 문장 목록으로"""
+        L = self.L
+        idx = [i for i in route.links if not self.internal[i]] or list(route.links)
+        steps = []                       # [도로명, 길이, 최고 위험등급, 첫 LINK, 끝 LINK]
+        for i in idx:
+            name = L.at[i, 'ROAD_NAME']
+            if steps and steps[-1][0] == name:
+                s = steps[-1]; s[1] += L.at[i, 'LENGTH']; s[2] = max(s[2], L.at[i, 'risk_grade']); s[4] = i
+            else:
+                steps.append([name, float(L.at[i, 'LENGTH']), int(L.at[i, 'risk_grade']), i, i])
+        # 아주 짧은 구간(교차로 앞뒤 조각)은 앞 구간에 붙임
+        merged = []
+        for s in steps:
+            if merged and s[1] < min_step_m and s is not steps[-1]:
+                m = merged[-1]; m[1] += s[1]; m[2] = max(m[2], s[2]); m[4] = s[4]
+            else:
+                merged.append(s)
+        out = []
+        for k, (name, length, grade, first, last) in enumerate(merged):
+            if k == 0:
+                act = '출발해서'
+            else:
+                d = (self.h_start[first] - self.h_end[merged[k-1][4]] + 540) % 360 - 180
+                w = self._turn_word(d)
+                act = {'직진': '직진해서', 'U턴': 'U턴해서'}.get(w, f'{w} 꺾어' if w.endswith('살짝') else f'{w}해서')
+            road = name if name != '이름 없는 도로' else '골목길'
+            out.append({'text': f'{act} {road} 따라', 'meters': round(length), 'grade': grade})
+        return out
+
+    def eta_minutes(self, route):
+        sub = self.L.iloc[route.links]
+        spd = sub['MAX_SPD'].fillna(30).clip(lower=10) * ETA_SPEED_FACTOR      # km/h
+        return float((sub['LENGTH'] / 1000 / spd).sum() * 60)
 
     # 클릭 좌표 → 노드
     def snap(self, lat, lon):
@@ -242,11 +315,11 @@ class Engine:
                 'detour_pct': pct(s.dist_m, p.dist_m), 'risk_cut_pct': -pct(s.risk, p.risk),
                 'high_cut': p.high - s.high, 'warnings': warn}
 
-def load_engine(gpkg_path, facilities_csv=None, turn_csv=None, strict_uturn=False):
+def load_engine(gpkg_path, facilities_csv=None, turn_csv=None, strict_uturn=False, places_csv=None):
     con = sqlite3.connect(gpkg_path)
     tn = pd.read_sql("select table_name from gpkg_contents where data_type='features'", con).table_name[0]
     df = pd.read_sql(f'select geom, LINK_ID, F_NODE, T_NODE, LENGTH, ROAD_NAME, in_ddm, train, '
-                     f'risk_score, risk_h, risk_grade from "{tn}"', con)
+                     f'risk_score, risk_h, risk_grade, MAX_SPD from "{tn}"', con)
     con.close()
     for c in ['LINK_ID', 'F_NODE', 'T_NODE']:
         df[c] = df[c].astype('int64')
@@ -265,6 +338,8 @@ def load_engine(gpkg_path, facilities_csv=None, turn_csv=None, strict_uturn=Fals
         fac = fac[fac['연결여부'] == '연결'].reset_index(drop=True)
     E = Engine(df, fac)
     import os
+    if places_csv and os.path.exists(places_csv):    # 동대문구 상가·건물·주소 검색용
+        E.places = pd.read_csv(places_csv, encoding='utf-8-sig')
     if turn_csv and os.path.exists(turn_csv):      # 파일이 없으면 회전제한 없이 실행
         E.set_turns(pd.read_csv(turn_csv))
         E.strict_uturn = strict_uturn

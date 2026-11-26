@@ -12,7 +12,8 @@ from engine import load_engine, MAX_SNAP_M
 GPKG = 'data/links_service.gpkg'
 FACILITIES = 'data/facility_nodes.csv'
 TURNS = 'data/turn_restrictions.csv'      # ITS TURNINFO 회전제한 (None이면 미반영)
-APP_VERSION = 'v0.1.0-draft'               # 초안 표시 (정식 버전이 되면 v1.0.0)
+PLACES = 'data/places_ddm.csv'            # 동대문구 상가·건물·도로명주소 검색용
+APP_VERSION = 'v0.1.2-draft'               # 초안 표시 (정식 버전이 되면 v1.0.0)
 LAMBDA_DEFAULT = 0.75
 CENTER = (37.5795, 127.0560)              # 동대문구 중심
 GRADE_COLOR = {4: '#E07A3C', 5: '#B5262E'}
@@ -46,7 +47,7 @@ table.cmp td.safe { color: #1F5FBF; font-weight: 700; }
 # ---------- 데이터: 처음 한 번만 읽음 ----------
 @st.cache_resource(show_spinner='도로망을 불러오는 중…')
 def get_engine():
-    return load_engine(GPKG, FACILITIES, TURNS)
+    return load_engine(GPKG, FACILITIES, TURNS, places_csv=PLACES)
 
 @st.cache_data
 def risk_geojson(_E, grades=(4, 5)):
@@ -58,6 +59,47 @@ def risk_geojson(_E, grades=(4, 5)):
 
 E = get_engine()
 
+# ---------- (선택) 카카오 장소 검색: .streamlit/secrets.toml 에 KAKAO_REST_KEY 가 있을 때만 ----------
+def kakao_key():
+    try:
+        return st.secrets.get('KAKAO_REST_KEY')
+    except Exception:
+        return None
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def kakao_search(q, key):
+    import json, urllib.parse, urllib.request
+    rect = '127.020,37.555,127.085,37.610'          # 동대문구 둘레 (경도,위도,경도,위도)
+    out = []
+    for kind in ('keyword', 'address'):
+        params = {'query': q, 'size': 10}
+        if kind == 'keyword':
+            params['rect'] = rect
+        url = f'https://dapi.kakao.com/v2/local/search/{kind}.json?' + urllib.parse.urlencode(params)
+        req = urllib.request.Request(url, headers={'Authorization': f'KakaoAK {key}'})
+        try:
+            with urllib.request.urlopen(req, timeout=3) as r:
+                docs = json.load(r).get('documents', [])
+        except Exception:
+            continue
+        for d in docs:
+            name = d.get('place_name') or d.get('address_name', '')
+            addr = d.get('road_address_name') or d.get('address_name', '')
+            if '동대문구' not in addr:
+                continue
+            out.append((name, addr, float(d['y']), float(d['x'])))
+    return out
+
+def search_all(q):
+    res = E.search(q)
+    key = kakao_key()
+    if key:
+        for name, addr, lat, lon in kakao_search(q, key):
+            node, dist = E.snap(lat, lon)
+            if dist <= MAX_SNAP_M:
+                res.insert(0, {'label': f'[카카오] {name} · {addr.replace("서울 동대문구 ", "")}', 'node': node})
+    return res[:40]
+
 # ---------- 화면 상태 ----------
 ss = st.session_state
 for k, v in {'o': None, 'd': None, 'o_name': None, 'd_name': None, 'last_click': None, 'msg': None}.items():
@@ -65,13 +107,13 @@ for k, v in {'o': None, 'd': None, 'o_name': None, 'd_name': None, 'last_click':
 
 # ---------- 사이드바: 장소 입력 ----------
 st.sidebar.markdown('## 어디로 가시나요?')
-st.sidebar.markdown('장소 이름이나 도로 이름을 입력하세요.  \n예) 경동시장, 경희의료원, 왕산로, 병원')
+st.sidebar.markdown('동대문구 안의 장소 이름, 건물 이름, 도로명주소를 입력하세요.  \n예) 청량리역, 경동시장, 왕산로 214, 전농동삼성아파트')
 
 def place_input(which, title):
     q = st.sidebar.text_input(title, key=f'q_{which}', placeholder='예) 경동시장')
     if not q:
         return
-    res = E.search(q)
+    res = search_all(q)
     if not res:
         st.sidebar.warning('찾는 장소가 없습니다. 다른 이름으로 입력하거나 지도를 눌러 주세요.')
         return
@@ -186,9 +228,20 @@ with right:
 <table class="cmp">
 <tr><th></th><th>일반경로</th><th>안전경로</th></tr>
 <tr><td>거리</td><td>{p.dist_m/1000:.1f} km</td><td class="safe">{s.dist_m/1000:.1f} km</td></tr>
+<tr><td>예상 시간*</td><td>약 {E.eta_minutes(p):.0f}분</td><td class="safe">약 {E.eta_minutes(s):.0f}분</td></tr>
 <tr><td>위험한 도로(5등급)</td><td>{p.high}곳</td><td class="safe">{s.high}곳</td></tr>
 <tr><td>누적 위험점수</td><td>{p.risk:.2f}</td><td class="safe">{s.risk:.2f}</td></tr>
 </table>""", unsafe_allow_html=True)
+        st.caption('* 예상 시간은 제한속도의 절반으로 달린다고 가정한 대략값입니다 (실시간 교통 미반영).')
+        st.markdown('#### 🧭 차례대로 안내 (안전경로)')
+        steps = E.directions(s)
+        lines = []
+        for i, stp in enumerate(steps, 1):
+            dist = f"{stp['meters']/1000:.1f} km" if stp['meters'] >= 1000 else f"{stp['meters']:,} m"
+            warn = ' ⚠️ **위험 구간**' if stp['grade'] >= 4 else ''
+            lines.append(f"{i}. {stp['text']} **{dist}**{warn}")
+        lines.append(f"{len(steps)+1}. 🔴 **도착: {name('d')}**")
+        st.markdown('\n'.join(lines))
         st.markdown('#### ⚠️ 안전경로에서 조심할 곳')
         w = res['warnings']
         if len(w):
